@@ -26,6 +26,7 @@ from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, Qt, QRegE
 from qgis.PyQt.QtGui import QIcon, QRegExpValidator
 from qgis.PyQt.QtWidgets import QAction
 from qgis.core import QgsProject, QgsWkbTypes, QgsGeometry, QgsVectorFileWriter, QgsFeature, QgsVectorLayer
+from qgis.gui import QgsMessageBar
 # Initialize Qt resources from file resources.py
 from .resources import *
 
@@ -34,7 +35,6 @@ from .sift_vector_dockwidget import SIFTVectorDockWidget
 import os.path
 
 import math
-import time
 
 def distance(start_point, end_point):
     return ((end_point[0]-start_point[0])**2 + (end_point[1]-start_point[1])**2) ** 0.5
@@ -44,11 +44,11 @@ def perpendicular_distance(point, start_point, end_point):
    denominator = distance(start_point, end_point)
    return numerator/denominator
 
-def compute_keypoints(vector, epsilon):
+def compute_keypoints(vector, epsilon): #Ramer-Douglas-Peucker algorithm
     dmax = 0.0
     index = -1
     
-    for i in range(1, len(vector)-1):
+    for i in range(1, len(vector)):
         d = perpendicular_distance(vector[i], vector[0], vector[-1])
         
         if d > dmax:
@@ -68,43 +68,36 @@ def compute_epsilon(vector):
         d += perpendicular_distance(vector[i], vector[0], vector[-1])
     
     return d/((len(vector)-2) or 1)
+
+def distances(k1, k2, k3):
+    return (
+        distance(k1, k2),
+        distance(k2, k3),
+        distance(k1, k3)
+    )
+
+def angle(a, b, c):
+    if b != 0:
+        return math.acos((a**2 + c**2 - b**2)/(2*a*c))*(180/math.pi)
+    return 0
     
-def compute_descriptors(vector, keypoints):
-    iter = 1
+def compute_descriptors(keypoints):
     descriptors = []
-    for i in range(1, len(vector) - 1):
-        if vector[i][0] == keypoints[iter][0] and vector[i][1] == keypoints[iter][1]:
-            left_point = vector[i-1]
-            left_keypoint = keypoints[iter-1]
-            right_point = vector[i+1]
-            right_keypoint = keypoints[iter+1]
-            keypoint = keypoints[iter]
-            
-            
-            l_a = distance(keypoint, left_point)
-            l_b = distance(left_point, left_keypoint)
-            l_c = distance(keypoint, left_keypoint)
-            
-            if l_b != 0:
-                l_angle = math.acos((l_a**2 + l_c**2 - l_b**2)/(2*l_a*l_c))*(180/math.pi)
-            else:
-                l_angle = 0
-                
-            
-            r_a = distance(keypoint, right_point)
-            r_b = distance(right_point, right_keypoint)
-            r_c = distance(keypoint, right_keypoint)
-            
-            if r_b != 0:
-                r_angle = math.acos((r_a**2 + r_c**2 - r_b**2)/(2*r_a*r_c))*(180/math.pi)
-            else:
-                r_angle = 0
-            
-            descriptors.append([keypoint, [l_a, l_angle], [r_a, r_angle]])
-            iter += 1
+    for i in range(1, len(keypoints)-1):
+        l_keypoints = [keypoints[i-1], keypoints[i-2]]
+        r_keypoints = [keypoints[i+1], keypoints[i+2]] if i != len(keypoints)-2 else [keypoints[i+1], keypoints[0]]
+        keypoint = keypoints[i]
+        
+        l_a, l_b, l_c = distances(keypoint, l_keypoints[0], l_keypoints[1])
+        l_angle = angle(l_a, l_b, l_c)
+        
+        r_a, r_b, r_c = distances(keypoint, r_keypoints[0], r_keypoints[1])
+        r_angle = angle(r_a, r_b, r_c)
+        
+        descriptors.append([keypoint, [l_a, l_angle], [r_a, r_angle]])
     return descriptors
     
-def compute(layer, one_vector = False, epsilon = None):
+def compute(layer, one_vector = False, epsilon = None, generalize = True):
     descriptors = []
     for feature in layer.getFeatures():
         geometry = feature.geometry()
@@ -114,23 +107,30 @@ def compute(layer, one_vector = False, epsilon = None):
                 for point in line_string:
                     epsilon_array.append(point)
             else:
-                keypoints = compute_keypoints(line_string, epsilon or compute_epsilon(line_string))
-                descriptors = descriptors + compute_descriptors(line_string, keypoints)
+                keypoints = compute_keypoints(line_string, epsilon or compute_epsilon(line_string)) if generalize else line_string
+                descriptors = descriptors + compute_descriptors(keypoints)
 
         if one_vector:
-            keypoints = compute_keypoints(epsilon_array, epsilon or compute_epsilon(epsilon_array))
-            descriptors = descriptors + compute_descriptors(epsilon_array, keypoints)
+            keypoints = compute_keypoints(epsilon_array, epsilon or compute_epsilon(epsilon_array)) if generalize else epsilon_array
+            descriptors = descriptors + compute_descriptors(keypoints)
         
     return descriptors
     
-def find(descr1, descr2):
+def is_around(num1, num2, perc):
+    return 1 - min(num1, num2)/max(num1, num2) <= perc/100
+    
+def find(descr1, descr2, perc = 0):
     output = []
     for keypoint1 in descr1:
         for keypoint2 in descr2:
-            if (round(keypoint1[1][0], 6) == round(keypoint2[1][0], 6) and
-                round(keypoint1[1][1], 6) == round(keypoint2[1][1], 6) and
-                round(keypoint1[2][0], 6) == round(keypoint2[2][0], 6) and
-                round(keypoint1[2][1], 6) == round(keypoint2[2][1], 6)):
+            if ((is_around(round(keypoint1[1][0],6), round(keypoint2[1][0],6), perc) and
+                 is_around(round(keypoint1[1][1],6), round(keypoint2[1][1],6), perc) and
+                 is_around(round(keypoint1[2][0],6), round(keypoint2[2][0],6), perc) and
+                 is_around(round(keypoint1[2][1],6), round(keypoint2[2][1],6), perc)) or 
+                (is_around(round(keypoint1[1][0],6), round(keypoint2[2][0],6), perc) and
+                 is_around(round(keypoint1[1][1],6), round(keypoint2[2][1],6), perc) and
+                 is_around(round(keypoint1[2][0],6), round(keypoint2[1][0],6), perc) and
+                 is_around(round(keypoint1[2][1],6), round(keypoint2[1][1],6), perc))):
                 output.append([keypoint1, keypoint2])
     return output
 
@@ -327,49 +327,91 @@ class SIFTVector:
             if self.dockwidget == None:
                 # Create the dockwidget (after translation) and keep reference
                 self.dockwidget = SIFTVectorDockWidget()
-                def change_enabled(line_edit):
-                    line_edit.setEnabled(not line_edit.isEnabled())
+                self.outputs = "1"
                 
-                validator = QRegExpValidator(QRegExp(r'[0-9].+'))
+                def change_enabled(widgets, is_checked = None):
+                    for widget in widgets:
+                        widget.setEnabled(is_checked or not widget.isEnabled())
+                        
+                def disable_line(comboBox, lineEdit):
+                    if comboBox.isEnabled and comboBox.isChecked():
+                        lineEdit.setEnabled(False)
+                
+                validator = QRegExpValidator(QRegExp(r'^(\d+(\.\d+)?|100(\.0+)?)$'))
                 self.dockwidget.lineEdit.setValidator(validator)
                 self.dockwidget.lineEdit_2.setValidator(validator)
                 
-                self.dockwidget.checkBox.clicked.connect(lambda: change_enabled(self.dockwidget.lineEdit))
-                self.dockwidget.checkBox_2.clicked.connect(lambda: change_enabled(self.dockwidget.lineEdit_2))
+                validator2 = QRegExpValidator(QRegExp(r'^([1-9]?\d(\.\d+)?|100(\.0+)?)$'))
+                self.dockwidget.lineEdit_3.setValidator(validator2)
+                
+                self.dockwidget.checkBox_6.clicked.connect(lambda: [change_enabled([self.dockwidget.lineEdit, 
+                                                                                   self.dockwidget.checkBox, 
+                                                                                   self.dockwidget.checkBox_3], 
+                                                                                   self.dockwidget.checkBox_6.isChecked()),
+                                                                    disable_line(self.dockwidget.checkBox, self.dockwidget.lineEdit)])
+                self.dockwidget.checkBox_7.clicked.connect(lambda: [change_enabled([self.dockwidget.lineEdit_2, 
+                                                                                   self.dockwidget.checkBox_2, 
+                                                                                   self.dockwidget.checkBox_4],
+                                                                                   self.dockwidget.checkBox_7.isChecked()),
+                                                                    disable_line(self.dockwidget.checkBox_2, self.dockwidget.lineEdit_2)])
+                
+                self.dockwidget.checkBox.clicked.connect(lambda: change_enabled([self.dockwidget.lineEdit]))
+                self.dockwidget.checkBox_2.clicked.connect(lambda: change_enabled([self.dockwidget.lineEdit_2]))
+                
+                self.dockwidget.checkBox_5.clicked.connect(lambda: change_enabled([self.dockwidget.lineEdit_3]))
                 
                 def compute_sift():
                     idx1 = self.dockwidget.comboBox.currentIndex()
                     idx2 = self.dockwidget.comboBox_2.currentIndex()
                     
-                    layer1 = layers[idx1]
-                    layer2 = layers[idx2]
+                    layer1 = self.layers[idx1]
+                    layer2 = self.layers[idx2]
                     
                     epsilon1 = None
                     epsilon2 = None
                     
                     if not self.dockwidget.checkBox.isChecked():
-                        epsilon1 = int(self.dockwidget.lineEdit.text() or "0")
+                        epsilon1 = float(self.dockwidget.lineEdit.text() or "0")
                     if not self.dockwidget.checkBox_2.isChecked():
-                        epsilon2 = int(self.dockwidget.lineEdit_2.text() or "0")
+                        epsilon2 = float(self.dockwidget.lineEdit_2.text() or "0")
                     
                     one_vector1 = self.dockwidget.checkBox_3.isChecked()
                     one_vector2 = self.dockwidget.checkBox_4.isChecked()
                     
-                    print(epsilon1)
-                    descr1 = compute(layer1, one_vector1, epsilon1)
-                    descr2 = compute(layer2, one_vector2, epsilon2)
-                    features = find(descr1, descr2)
+                    generalize1 = self.dockwidget.checkBox_6.isChecked()
+                    generalize2 = self.dockwidget.checkBox_7.isChecked()
                     
-                    vl = processing.run("native:saveselectedfeatures", {'INPUT': layer1, 'OUTPUT': 'memory:'})['OUTPUT']
-                    pr = vl.dataProvider()
-                    index = 0
-                    for feature in features:
-                        f = QgsFeature(index)
-                        f.setGeometry(QgsGeometry.fromPolylineXY([feature[0][0], feature[1][0]]))
-                        pr.addFeature(f)
-                        vl.updateExtents()
-                        index += 1
-                    QgsProject.instance().addMapLayer(vl)
+                    descr1 = compute(layer1, one_vector1, epsilon1, generalize1)
+                    descr2 = compute(layer2, one_vector2, epsilon2, generalize2)
+                    
+                    perc = 0
+                    if self.dockwidget.checkBox_5.isChecked():
+                        perc = float(self.dockwidget.lineEdit_3.text() or "0")
+
+                    features = find(descr1, descr2, perc)
+                    
+                    if len(features) != 0:
+                        vl = processing.run("native:saveselectedfeatures", {'INPUT': layer1, 'OUTPUT': 'memory:'})['OUTPUT']
+                        vl.setName("output" + self.outputs)
+                        
+                        pr = vl.dataProvider()
+                        for feature in features:
+                            f = QgsFeature()
+                            f.setGeometry(QgsGeometry.fromPolylineXY([feature[0][0], feature[1][0]]))
+                            pr.addFeature(f)
+                            vl.updateExtents()
+                            
+                        QgsProject.instance().addMapLayer(vl)
+                        
+                        self.layers = list(QgsProject.instance().mapLayers().values())
+                        layers_names = [layer.name() for layer in self.layers]
+                        index = layers_names.index("output" + self.outputs)
+                        self.dockwidget.comboBox.insertItem(index, "output" + self.outputs)
+                        self.dockwidget.comboBox_2.insertItem(index, "output" + self.outputs)
+                        
+                        self.outputs = str(int(self.outputs) + 1)
+                    else:
+                        self.iface.messageBar().pushMessage("Информация", "Не найдены общие ключевые точки", level=0)
                     
                 self.dockwidget.pushButton.clicked.connect(compute_sift)
 
@@ -381,7 +423,7 @@ class SIFTVector:
             self.iface.addDockWidget(Qt.TopDockWidgetArea, self.dockwidget)
             self.dockwidget.show()
             
-            layers = list(QgsProject.instance().mapLayers().values())
-            layers_names = [layer.name() for layer in layers]
+            self.layers = list(QgsProject.instance().mapLayers().values())
+            layers_names = [layer.name() for layer in self.layers]
             self.dockwidget.comboBox.addItems(layers_names)
             self.dockwidget.comboBox_2.addItems(layers_names)
